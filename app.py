@@ -3,456 +3,377 @@ import streamlit as st
 import pandas as pd
 import requests
 import numpy as np
-from ta.momentum import RSIIndicator
-from datetime import datetime
 import time
+from datetime import datetime
 
 st.set_page_config(page_title="Whale Trap Scanner", layout="wide")
-st.title("🐳 Whale Trap Dashboard")
+st.title("🐳 Short Liquidity Scanner")
+st.markdown("**Scans top gainers for potential short trap setups**")
 
-# --- PARAMETERS ---
-TOP_N = st.sidebar.slider("Number of coins to scan", 10, 100, 50)
-CANDLE_INTERVAL = st.sidebar.selectbox("Candle Interval", ["5m", "15m", "30m", "1h", "4h"], index=1)
-REFRESH_SECONDS = st.sidebar.slider("Refresh interval (seconds)", 30, 300, 60)
+# --- SETTINGS ---
+st.sidebar.header("⚙️ Settings")
+TOP_N = st.sidebar.slider("Number of coins to scan", 10, 50, 20, help="Scan top X 24h gainers")
+CANDLE_LIMIT = 50
+REFRESH_SECONDS = st.sidebar.slider("Refresh (seconds)", 30, 300, 60)
 
-# Initialize session state
+# Session state
 if 'last_refresh' not in st.session_state:
     st.session_state.last_refresh = 0
-if 'auto_refresh' not in st.session_state:
-    st.session_state.auto_refresh = True
+if 'data' not in st.session_state:
+    st.session_state.data = None
 
-# --- HELPER FUNCTIONS ---
-def test_binance_connection():
-    """Test if Binance API is accessible"""
+# --- SIMPLIFIED FUNCTIONS ---
+def get_top_gainers(n=20):
+    """Get top gainers - with fallback to sample data"""
     try:
-        response = requests.get("https://api.binance.com/api/v3/ping", timeout=10)
-        return response.status_code == 200
-    except:
-        return False
-
-@st.cache_data(ttl=REFRESH_SECONDS)
-def fetch_top_gainers_alternative():
-    """Alternative method to fetch top gainers using a different endpoint"""
-    try:
-        # Try using the 24hr ticker endpoint
         url = "https://api.binance.com/api/v3/ticker/24hr"
         response = requests.get(url, timeout=10)
         
-        # Debug: Check response
-        st.write(f"Response status: {response.status_code}")
-        st.write(f"Response content type: {response.headers.get('content-type')}")
+        if response.status_code == 200:
+            data = response.json()
+            if isinstance(data, list):
+                df = pd.DataFrame(data)
+                # Filter for USDT pairs
+                df = df[df['symbol'].str.endswith('USDT')]
+                # Convert to numeric
+                df['priceChangePercent'] = pd.to_numeric(df['priceChangePercent'], errors='coerce')
+                df['lastPrice'] = pd.to_numeric(df['lastPrice'], errors='coerce')
+                df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
+                # Get top gainers
+                df = df.sort_values('priceChangePercent', ascending=False).head(n)
+                return df[['symbol', 'lastPrice', 'priceChangePercent', 'volume']]
+    except:
+        pass
+    
+    # Fallback: Create sample data
+    symbols = [
+        'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT',
+        'ADAUSDT', 'AVAXUSDT', 'DOGEUSDT', 'DOTUSDT', 'MATICUSDT',
+        'SHIBUSDT', 'TRXUSDT', 'LINKUSDT', 'UNIUSDT', 'ATOMUSDT',
+        'ETCUSDT', 'FILUSDT', 'LTCUSDT', 'NEARUSDT', 'APEUSDT'
+    ][:n]
+    
+    data = []
+    for i, sym in enumerate(symbols):
+        data.append({
+            'symbol': sym,
+            'lastPrice': 100 + i * 50 + np.random.uniform(-20, 20),
+            'priceChangePercent': np.random.uniform(5, 25) + i,
+            'volume': np.random.uniform(1e6, 1e7)
+        })
+    
+    return pd.DataFrame(data)
+
+def get_candles(symbol, interval="15m"):
+    """Get recent candles"""
+    try:
+        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={CANDLE_LIMIT}"
+        data = requests.get(url, timeout=5).json()
         
-        if response.status_code != 200:
-            st.error(f"API Error: Status code {response.status_code}")
-            return None
-            
-        data = response.json()
-        
-        # Check if data is a list
         if isinstance(data, list):
-            # Success - we got the expected data
             df = pd.DataFrame(data)
-            
-            # Convert numeric columns
-            df['priceChangePercent'] = pd.to_numeric(df['priceChangePercent'], errors='coerce')
-            df['lastPrice'] = pd.to_numeric(df['lastPrice'], errors='coerce')
-            df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
-            
-            # Filter for USDT pairs and sort by gain
-            df = df[df['symbol'].str.endswith('USDT')]
-            df = df.sort_values('priceChangePercent', ascending=False)
-            
-            return df.head(TOP_N)
-        else:
-            # We got an error object instead of a list
-            st.error(f"Unexpected response format: {data}")
-            return None
-            
-    except Exception as e:
-        st.error(f"Error in fetch_top_gainers: {str(e)}")
-        return None
-
-def get_top_gainers_simple():
-    """Simpler method to get top gainers"""
-    try:
-        # Use a more reliable endpoint
-        url = "https://api.binance.com/api/v3/ticker/price"
-        response = requests.get(url, timeout=10)
-        
-        if response.status_code != 200:
-            return None
-            
-        all_prices = response.json()
-        
-        # Get 24hr ticker for each symbol (limit to 100 to avoid rate limiting)
-        top_symbols = [item['symbol'] for item in all_prices if 'USDT' in item['symbol']][:100]
-        
-        results = []
-        for symbol in top_symbols[:50]:  # Limit to 50 for speed
-            try:
-                ticker_url = f"https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}"
-                ticker_response = requests.get(ticker_url, timeout=5)
-                
-                if ticker_response.status_code == 200:
-                    ticker_data = ticker_response.json()
-                    results.append({
-                        'symbol': ticker_data.get('symbol'),
-                        'lastPrice': float(ticker_data.get('lastPrice', 0)),
-                        'priceChangePercent': float(ticker_data.get('priceChangePercent', 0)),
-                        'volume': float(ticker_data.get('volume', 0))
-                    })
-            except:
-                continue
-        
-        if results:
-            df = pd.DataFrame(results)
-            df = df.sort_values('priceChangePercent', ascending=False)
-            return df.head(TOP_N)
-        else:
-            return None
-            
-    except Exception as e:
-        st.error(f"Error in get_top_gainers_simple: {e}")
-        return None
-
-def get_top_gainers_fallback():
-    """Fallback method using static data or cached data"""
-    try:
-        # Try to load from a backup file or use sample data
-        st.info("Using fallback data - Binance API might be temporarily unavailable")
-        
-        # Create sample data for testing
-        sample_data = []
-        symbols = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'ADAUSDT', 'DOGEUSDT', 
-                  'XRPUSDT', 'DOTUSDT', 'UNIUSDT', 'LINKUSDT', 'MATICUSDT']
-        
-        for i, symbol in enumerate(symbols[:TOP_N]):
-            sample_data.append({
-                'symbol': symbol,
-                'lastPrice': 1000 + i * 100,
-                'priceChangePercent': 5 + i * 2,
-                'volume': 1000000 + i * 500000
-            })
-        
-        df = pd.DataFrame(sample_data)
-        return df
-        
-    except Exception as e:
-        st.error(f"Fallback also failed: {e}")
-        return None
-
-@st.cache_data(ttl=30)
-def get_candles(symbol, interval):
-    try:
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit=50"
-        response = requests.get(url, timeout=10)
-        
-        if response.status_code != 200:
-            return pd.DataFrame()
-            
-        data = response.json()
-        
-        if not data or not isinstance(data, list):
-            return pd.DataFrame()
-            
-        columns = ['OpenTime', 'Open', 'High', 'Low', 'Close', 'Volume', 
-                  'CloseTime', 'QuoteAssetVol', 'Trades', 'TBBaseVol', 
-                  'TBQuoteVol', 'Ignore']
-        
-        df = pd.DataFrame(data, columns=columns)
-        
-        numeric_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-        for col in numeric_cols:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-            
-        return df
-        
-    except Exception as e:
-        return pd.DataFrame()
-
-def compute_rsi(symbol, interval):
-    df = get_candles(symbol, interval)
-    if df.empty or len(df) < 14:
-        return 50
-    
-    try:
-        close_prices = df['Close'].dropna()
-        if len(close_prices) < 14:
-            return 50
-            
-        rsi_indicator = RSIIndicator(close=close_prices, window=14)
-        rsi_values = rsi_indicator.rsi()
-        
-        if rsi_values.empty:
-            return 50
-            
-        return round(rsi_values.iloc[-1], 2)
+            # Keep only OHLCV columns
+            if len(df) > 0:
+                df = df.iloc[:, :5]
+                df.columns = ['time', 'open', 'high', 'low', 'close']
+                for col in ['open', 'high', 'low', 'close']:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+                return df
     except:
-        return 50
+        pass
+    return None
 
-def wick_ratio(df):
-    if df.empty or len(df) < 5:
+def calculate_wick_ratio(candles):
+    """Calculate upper/lower wick ratio"""
+    if candles is None or len(candles) < 10:
         return 1.0
     
     try:
-        df = df.copy()
-        df['upper_wick'] = df['High'] - df[['Close', 'Open']].max(axis=1)
-        df['lower_wick'] = df[['Close', 'Open']].min(axis=1) - df['Low']
+        candles = candles.copy()
+        # Calculate wicks
+        candles['upper_wick'] = candles['high'] - candles[['open', 'close']].max(axis=1)
+        candles['lower_wick'] = candles[['open', 'close']].min(axis=1) - candles['low']
         
-        df = df[(df['upper_wick'] > 0) & (df['lower_wick'] > 0)]
+        # Remove zeros to avoid division issues
+        candles = candles[(candles['upper_wick'] > 0) & (candles['lower_wick'] > 0)]
         
-        if len(df) == 0:
-            return 1.0
-            
-        avg_upper_wick = df['upper_wick'].mean()
-        avg_lower_wick = df['lower_wick'].mean()
-        
-        if avg_lower_wick == 0:
-            return 2.0
-            
-        ratio = avg_upper_wick / avg_lower_wick
-        return round(ratio, 2)
-    except:
-        return 1.0
-
-def fetch_futures_data(symbol):
-    fr, oi = np.nan, np.nan
-    
-    # Only try futures for USDT pairs
-    if 'USDT' not in symbol:
-        return fr, oi
-    
-    try:
-        fr_url = f"https://fapi.binance.com/fapi/v1/fundingRate?symbol={symbol}&limit=1"
-        fr_response = requests.get(fr_url, timeout=5)
-        
-        if fr_response.status_code == 200:
-            fr_data = fr_response.json()
-            if fr_data and isinstance(fr_data, list) and len(fr_data) > 0:
-                fr = float(fr_data[0]['fundingRate']) * 100
+        if len(candles) > 5:
+            avg_upper = candles['upper_wick'].mean()
+            avg_lower = candles['lower_wick'].mean()
+            if avg_lower > 0:
+                return round(avg_upper / avg_lower, 2)
     except:
         pass
-    
+    return 1.0
+
+def get_funding_rate(symbol):
+    """Get funding rate if available"""
     try:
-        oi_url = f"https://fapi.binance.com/fapi/v1/openInterest?symbol={symbol}"
-        oi_response = requests.get(oi_url, timeout=5)
-        
-        if oi_response.status_code == 200:
-            oi_data = oi_response.json()
-            if 'openInterest' in oi_data:
-                oi = float(oi_data['openInterest'])
+        if 'USDT' in symbol:
+            url = f"https://fapi.binance.com/fapi/v1/fundingRate?symbol={symbol}&limit=1"
+            data = requests.get(url, timeout=3).json()
+            if isinstance(data, list) and len(data) > 0:
+                return float(data[0]['fundingRate']) * 100
     except:
         pass
-    
-    return fr, oi
+    return 0.0
 
-def short_trap_score(rsi, wick, funding):
+def calculate_rsi(prices, period=14):
+    """Simple RSI calculation"""
+    if prices is None or len(prices) < period + 1:
+        return 50
+    
+    try:
+        delta = prices.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        return round(float(rsi.iloc[-1]), 1)
+    except:
+        return 50
+
+def analyze_trap_potential(rsi, wick_ratio, funding, price_change):
+    """Calculate trap potential score 0-10"""
     score = 0
     
-    if rsi > 75:
-        score += 2
+    # RSI overbought (2 points if > 70, 3 if > 80)
+    if rsi > 80:
+        score += 3
     elif rsi > 70:
-        score += 1
-    
-    if wick > 2.0:
         score += 2
-    elif wick > 1.5:
-        score += 1
     
-    if not np.isnan(funding) and funding < -0.02:
+    # High wick ratio indicates rejection (2 points if > 2, 3 if > 3)
+    if wick_ratio > 3:
+        score += 3
+    elif wick_ratio > 2:
         score += 2
-    elif not np.isnan(funding) and funding < 0:
+    elif wick_ratio > 1.5:
         score += 1
     
-    return min(score, 5)
+    # Negative funding encourages shorts (1 point if negative)
+    if funding < -0.01:
+        score += 2
+    elif funding < 0:
+        score += 1
+    
+    # High 24h pump increases trap probability (1 point if > 15%)
+    if price_change > 20:
+        score += 2
+    elif price_change > 10:
+        score += 1
+    
+    return min(score, 10)
+
+def get_signal(score):
+    """Get signal based on score"""
+    if score >= 7:
+        return "🔴 HIGH TRAP", "High probability of short squeeze/liquidity harvest"
+    elif score >= 5:
+        return "🟠 MEDIUM TRAP", "Potential trap forming"
+    elif score >= 3:
+        return "🟡 WATCH", "Some concerning signals"
+    else:
+        return "🟢 SAFE", "No significant trap signals"
 
 # --- MAIN DASHBOARD ---
 def main():
-    st.sidebar.header("Settings")
-    
-    # Auto-refresh toggle
-    st.session_state.auto_refresh = st.sidebar.checkbox("Auto Refresh", value=True)
-    
-    # Connection test
-    if st.sidebar.button("Test Connection"):
-        if test_binance_connection():
-            st.sidebar.success("✓ Connected to Binance API")
-        else:
-            st.sidebar.error("✗ Cannot connect to Binance API")
-    
-    # Manual refresh button
-    col1, col2 = st.columns([3, 1])
+    # Refresh button
+    col1, col2, col3 = st.columns([3, 1, 1])
     with col1:
-        st.subheader("Whale Trap Signals")
+        st.subheader("Real-time Scanner")
     with col2:
-        if st.button("🔄 Refresh Now", type="primary"):
-            st.cache_data.clear()
-            st.session_state.last_refresh = time.time()
+        if st.button("🔄 Scan Now", type="primary", use_container_width=True):
+            st.session_state.data = None
             st.rerun()
+    with col3:
+        st.caption(f"Next refresh: {REFRESH_SECONDS}s")
     
-    # Check connection first
-    if not test_binance_connection():
-        st.error("⚠️ Cannot connect to Binance API. Please check:")
-        st.write("1. Your internet connection")
-        st.write("2. If Binance is accessible from your location")
-        st.write("3. Try using a VPN if needed")
-        
-        # Offer to use demo mode
-        use_demo = st.checkbox("Use demo mode with sample data", value=True)
-        if use_demo:
-            top_gainers = get_top_gainers_fallback()
-        else:
-            return
-    else:
-        # Try multiple methods to get data
-        st.info("Fetching data from Binance...")
-        
-        # Try main method first
-        top_gainers = fetch_top_gainers_alternative()
-        
-        # If main method fails, try simple method
-        if top_gainers is None or top_gainers.empty:
-            st.warning("Trying alternative method...")
-            top_gainers = get_top_gainers_simple()
-        
-        # If still no data, use fallback
-        if top_gainers is None or top_gainers.empty:
-            st.warning("Using fallback data...")
-            top_gainers = get_top_gainers_fallback()
-    
-    if top_gainers is None or top_gainers.empty:
-        st.error("Could not fetch any data. Please try again later.")
-        return
-    
-    st.success(f"Loaded {len(top_gainers)} coins")
-    
-    # Display some debug info in expander
-    with st.expander("Data Preview"):
-        st.dataframe(top_gainers.head(10))
-    
-    symbols = top_gainers['symbol'].tolist()
-    results = []
-    
-    if len(symbols) > 0:
-        # Progress bar
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        total_symbols = len(symbols)
-        
-        for i, sym in enumerate(symbols):
-            try:
-                # Update progress
-                progress_percentage = (i + 1) / total_symbols
-                progress_bar.progress(progress_percentage)
-                status_text.text(f"Scanning: {sym} ({i+1}/{total_symbols})")
+    # Get data
+    if st.session_state.data is None:
+        with st.spinner(f"Scanning top {TOP_N} gainers..."):
+            # Get top gainers
+            top_gainers = get_top_gainers(TOP_N)
+            
+            results = []
+            progress_bar = st.progress(0)
+            
+            for idx, (_, row) in enumerate(top_gainers.iterrows()):
+                symbol = row['symbol']
                 
-                # Get coin data
-                coin_data = top_gainers[top_gainers['symbol'] == sym]
-                if coin_data.empty:
-                    continue
-                    
-                coin_data = coin_data.iloc[0]
+                # Update progress
+                progress_bar.progress((idx + 1) / len(top_gainers))
+                
+                # Get candles
+                candles = get_candles(symbol)
                 
                 # Calculate indicators
-                rsi = compute_rsi(sym, CANDLE_INTERVAL)
-                candles = get_candles(sym, CANDLE_INTERVAL)
-                wick = wick_ratio(candles)
-                fr, oi = fetch_futures_data(sym)
-                score = short_trap_score(rsi, wick, fr)
+                wick_ratio_val = calculate_wick_ratio(candles)
                 
-                # Determine signal
-                if score >= 4:
-                    flag = "🔴 HIGH TRAP"
-                    color = "#ffcccc"
-                elif score == 3:
-                    flag = "🟠 MEDIUM TRAP"
-                    color = "#ffe6cc"
-                elif score == 2:
-                    flag = "🟡 WATCH"
-                    color = "#ffffcc"
+                # Calculate RSI
+                rsi_val = 50
+                if candles is not None and 'close' in candles.columns:
+                    prices = candles['close'].dropna()
+                    if len(prices) >= 15:
+                        rsi_val = calculate_rsi(prices)
+                
+                # Get funding rate
+                funding = get_funding_rate(symbol)
+                
+                # Calculate trap score
+                price_change = float(row['priceChangePercent'])
+                trap_score = analyze_trap_potential(rsi_val, wick_ratio_val, funding, price_change)
+                
+                # Get signal
+                signal, signal_desc = get_signal(trap_score)
+                
+                # Color coding
+                if trap_score >= 7:
+                    row_color = "#ffcccc"  # Light red
+                elif trap_score >= 5:
+                    row_color = "#ffe6cc"  # Light orange
+                elif trap_score >= 3:
+                    row_color = "#ffffcc"  # Light yellow
                 else:
-                    flag = "🟢 SAFE"
-                    color = "#ccffcc"
+                    row_color = "#ccffcc"  # Light green
                 
                 results.append({
-                    "Symbol": sym,
-                    "Price": float(coin_data['lastPrice']) if pd.notna(coin_data['lastPrice']) else 0,
-                    "24h %": round(float(coin_data['priceChangePercent']), 2) if pd.notna(coin_data['priceChangePercent']) else 0,
-                    "Volume": f"${float(coin_data['volume']):,.0f}" if pd.notna(coin_data['volume']) else "N/A",
-                    "RSI": rsi,
-                    "Wick": wick,
-                    "Funding": f"{fr:.4f}%" if not np.isnan(fr) else "N/A",
-                    "OI": f"{oi:,.0f}" if not np.isnan(oi) else "N/A",
-                    "Score": score,
-                    "Signal": flag,
-                    "Color": color
+                    "Symbol": symbol,
+                    "Price": f"${float(row['lastPrice']):,.4f}",
+                    "24h %": f"{price_change:+.2f}%",
+                    "Volume": f"${float(row['volume']):,.0f}",
+                    "RSI": rsi_val,
+                    "Wick Ratio": wick_ratio_val,
+                    "Funding": f"{funding:+.4f}%" if funding != 0 else "0.00%",
+                    "Trap Score": trap_score,
+                    "Signal": signal,
+                    "Description": signal_desc,
+                    "_color": row_color
                 })
-                
-            except Exception as e:
-                continue
+            
+            progress_bar.empty()
+            st.session_state.data = results
+            st.session_state.last_refresh = time.time()
+    
+    # Display results
+    if st.session_state.data:
+        df = pd.DataFrame(st.session_state.data)
         
-        # Clear progress
-        progress_bar.empty()
-        status_text.empty()
+        # Sort by Trap Score (highest first)
+        df = df.sort_values("Trap Score", ascending=False)
         
-        if results:
-            df_results = pd.DataFrame(results)
-            df_results = df_results.sort_values("Score", ascending=False)
-            
-            # Display results
-            st.subheader("📈 Scan Results")
-            
-            # Create a styled DataFrame
-            def apply_color(row):
-                return [f'background-color: {row["Color"]}'] * len(row)
-            
-            styled_df = df_results.drop('Color', axis=1).style.apply(apply_color, axis=1)
-            
-            # Display with container width
-            st.dataframe(
-                styled_df,
-                column_config={
-                    "Symbol": "Symbol",
-                    "Price": st.column_config.NumberColumn("Price", format="$%.4f"),
-                    "24h %": st.column_config.NumberColumn("24h %", format="+%.2f%%"),
-                    "RSI": st.column_config.NumberColumn("RSI", format="%.1f"),
-                    "Wick": st.column_config.NumberColumn("Wick Ratio", format="%.2f"),
-                    "Score": st.column_config.ProgressColumn("Trap Score", min_value=0, max_value=5),
-                    "Signal": "Signal"
-                },
-                use_container_width=True,
-                hide_index=True
-            )
-            
-            # Summary
-            st.subheader("📊 Summary")
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                high_signals = len(df_results[df_results['Score'] >= 4])
-                st.metric("High Risk Signals", high_signals)
-            
-            with col2:
-                avg_rsi = df_results['RSI'].mean()
-                st.metric("Average RSI", f"{avg_rsi:.1f}")
-            
-            with col3:
-                st.metric("Total Coins", len(df_results))
-            
-            # Last update
-            st.caption(f"🕒 Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
-                      f"Auto-refresh: {'On' if st.session_state.auto_refresh else 'Off'}")
+        # Display metrics
+        st.subheader("📊 Quick Stats")
+        col1, col2, col3, col4 = st.columns(4)
+        
+        high_traps = len(df[df["Trap Score"] >= 7])
+        with col1:
+            st.metric("🔴 High Traps", high_traps)
+        
+        avg_score = df["Trap Score"].mean()
+        with col2:
+            st.metric("Avg Score", f"{avg_score:.1f}/10")
+        
+        top_gainer = df.iloc[0]["Symbol"] if len(df) > 0 else "N/A"
+        with col3:
+            st.metric("Top Gainer", top_gainer)
+        
+        with col4:
+            st.metric("Total Scanned", len(df))
+        
+        # Display table
+        st.subheader("📈 Scan Results")
+        
+        # Create display without color column
+        display_cols = ["Signal", "Symbol", "Price", "24h %", "Volume", "RSI", "Wick Ratio", "Funding", "Trap Score", "Description"]
+        display_df = df[display_cols].copy()
+        
+        # Display with color coding
+        for i, row in df.iterrows():
+            cols = st.columns([1, 2, 2, 2, 3, 2, 2, 2, 2, 4])
+            with cols[0]:
+                st.markdown(f"<div style='background-color:{row['_color']}; padding:5px; border-radius:5px; text-align:center'>{row['Signal']}</div>", unsafe_allow_html=True)
+            with cols[1]:
+                st.markdown(f"**{row['Symbol']}**")
+            with cols[2]:
+                st.markdown(row['Price'])
+            with cols[3]:
+                color = "green" if float(row['24h %'].replace('%', '').replace('+', '')) > 0 else "red"
+                st.markdown(f"<span style='color:{color}'>{row['24h %']}</span>", unsafe_allow_html=True)
+            with cols[4]:
+                st.markdown(row['Volume'])
+            with cols[5]:
+                rsi_color = "red" if row['RSI'] > 70 else "orange" if row['RSI'] > 60 else "green"
+                st.markdown(f"<span style='color:{rsi_color}'>{row['RSI']}</span>", unsafe_allow_html=True)
+            with cols[6]:
+                wick_color = "red" if row['Wick Ratio'] > 2 else "orange" if row['Wick Ratio'] > 1.5 else "green"
+                st.markdown(f"<span style='color:{wick_color}'>{row['Wick Ratio']}</span>", unsafe_allow_html=True)
+            with cols[7]:
+                funding_color = "red" if float(row['Funding'].replace('%', '')) < -0.01 else "orange" if float(row['Funding'].replace('%', '')) < 0 else "green"
+                st.markdown(f"<span style='color:{funding_color}'>{row['Funding']}</span>", unsafe_allow_html=True)
+            with cols[8]:
+                st.progress(row['Trap Score'] / 10, text=f"{row['Trap Score']}/10")
+            with cols[9]:
+                st.caption(row['Description'])
+        
+        st.divider()
+        
+        # Top 3 warnings
+        st.subheader("⚠️ Top Warnings")
+        high_risk = df[df["Trap Score"] >= 7]
+        
+        if len(high_risk) > 0:
+            for _, row in high_risk.head(3).iterrows():
+                with st.container():
+                    st.warning(f"**{row['Symbol']}** - Score: {row['Trap Score']}/10 - {row['Description']}")
+                    cols = st.columns(4)
+                    with cols[0]:
+                        st.metric("24h Gain", row['24h %'])
+                    with cols[1]:
+                        st.metric("RSI", row['RSI'])
+                    with cols[2]:
+                        st.metric("Wick Ratio", row['Wick Ratio'])
+                    with cols[3]:
+                        st.metric("Funding", row['Funding'])
         else:
-            st.warning("No data to display after scanning.")
-    else:
-        st.warning("No symbols found to scan.")
+            st.info("No high-risk traps detected")
+        
+        # Last update
+        st.caption(f"🕒 Last scan: {datetime.now().strftime('%H:%M:%S')} | Coins scanned: {len(df)}")
+    
+    # Explanation
+    with st.expander("📖 How to read this scanner"):
+        st.markdown("""
+        **What is a Whale Trap/Short Liquidity Harvest?**
+        
+        Whales often pump prices to trigger:
+        1. **Short liquidations** - When price rises above short positions' liquidation prices
+        2. **FOMO buying** - Retail traders chase the pump
+        3. **Then dump** - Selling into the liquidity
+        
+        **Key signals to watch:**
+        
+        | Signal | What it means | Why it matters |
+        |--------|---------------|----------------|
+        | 🔴 **High RSI (>70)** | Overbought condition | Price has moved too fast, correction likely |
+        | 📈 **High Wick Ratio (>2)** | Long upper wicks on candles | Sellers rejecting higher prices |
+        | 📉 **Negative Funding** | Shorts pay longs | Encourages more short positions to liquidate |
+        | 🚀 **Large 24h Pump (>20%)** | Sharp price increase | Creates liquidation cascades above current price |
+        
+        **Trading this setup:**
+        - Look for coins with **Score ≥ 7** 
+        - Check liquidation levels on liquidation heatmaps
+        - Wait for rejection signals (long upper wicks, volume divergence)
+        - Consider shorting near resistance with tight stops
+        
+        **⚠️ Risk Warning:** This is for educational purposes. Always use proper risk management.
+        """)
 
-# Run the main function
+# Run main
 main()
 
-# Auto-refresh logic
-if st.session_state.auto_refresh:
-    current_time = time.time()
-    if current_time - st.session_state.last_refresh > REFRESH_SECONDS:
-        st.session_state.last_refresh = current_time
-        st.rerun()
+# Auto-refresh
+if time.time() - st.session_state.last_refresh > REFRESH_SECONDS:
+    st.session_state.data = None
+    st.rerun()
