@@ -17,14 +17,34 @@ REFRESH_SECONDS = 60  # Auto-refresh
 
 # --- HELPER FUNCTIONS ---
 @st.cache_data(ttl=REFRESH_SECONDS)
+@st.cache_data(ttl=REFRESH_SECONDS)
 def fetch_top_gainers():
     url = "https://api.binance.com/api/v3/ticker/24hr"
-    resp = requests.get(url).json()
-    df = pd.DataFrame(resp)
-    df['priceChangePercent'] = df['priceChangePercent'].astype(float)
-    top_gainers = df.sort_values('priceChangePercent', ascending=False).head(TOP_N)
-    top_gainers = top_gainers[['symbol','lastPrice','priceChangePercent','volume']]
-    return top_gainers
+    resp = requests.get(url, timeout=10)
+
+    try:
+        data = resp.json()
+    except:
+        return pd.DataFrame()
+
+    # 🚨 CRITICAL FIX
+    if not isinstance(data, list):
+        st.warning("Binance API temporarily unavailable. Retrying...")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(data)
+
+    required = {"symbol", "lastPrice", "priceChangePercent", "volume"}
+    if not required.issubset(df.columns):
+        return pd.DataFrame()
+
+    df["priceChangePercent"] = pd.to_numeric(df["priceChangePercent"], errors="coerce")
+
+    return (
+        df.sort_values("priceChangePercent", ascending=False)
+        .head(TOP_N)[["symbol", "lastPrice", "priceChangePercent", "volume"]]
+    )
+
 
 def get_candles(symbol):
     url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={CANDLE_INTERVAL}&limit={CANDLE_LIMIT}"
