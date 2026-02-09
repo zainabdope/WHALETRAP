@@ -10,7 +10,7 @@ st.set_page_config(page_title="Whale Trap Scanner", layout="wide")
 st.title("🐳 Whale Trap Dashboard")
 
 # --- PARAMETERS ---
-TOP_N = 50          # Number of coins to scan
+TOP_N = 30          # Number of coins to scan
 CANDLE_INTERVAL = "15m"
 CANDLE_LIMIT = 50   # Candles for RSI & wick
 REFRESH_SECONDS = 60  # Auto-refresh
