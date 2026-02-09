@@ -1,5 +1,5 @@
 # whale_trap_dashboard.py
-import streamlit as st
+import streamlit as st 
 import pandas as pd
 import requests
 import numpy as np
